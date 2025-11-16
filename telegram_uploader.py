@@ -51,8 +51,7 @@ async def _send_single(
         "allow_cache": False,
     }
 
-    if not isinstance(payload, Path):
-        send_kwargs["file_name"] = filename
+    send_kwargs["file_name"] = filename
 
     if chunk_size is not None:
         send_kwargs["chunk_size"] = chunk_size
