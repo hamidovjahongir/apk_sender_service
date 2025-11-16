@@ -1,5 +1,6 @@
 import os
 import shutil
+import uuid
 from pathlib import Path
 from typing import BinaryIO
 
@@ -20,8 +21,8 @@ app.add_middleware(
 )
 
 
-def save_upload(file: UploadFile) -> Path:
-    target = UPLOAD_DIR / file.filename
+def save_upload(file: UploadFile, filename: str | None = None) -> Path:
+    target = UPLOAD_DIR / (filename or file.filename)
     with target.open("wb") as out:
         shutil.copyfileobj(file.file, out)
     return target
@@ -47,6 +48,7 @@ async def deploy(
         raise HTTPException(status_code=413, detail="File exceeds 2GB Telegram limit")
 
     saved_path: Path | None = None
+    temp_path: Path | None = None
     target: Path | BinaryIO
     filename_to_send = file.filename
 
@@ -58,11 +60,9 @@ async def deploy(
             filename_to_send = saved_path.name
         else:
             await file.seek(0)
-            target = file.file
-            try:
-                target.name = filename_to_send
-            except Exception:
-                pass
+            temp_filename = f"tmp-{uuid.uuid4().hex}-{file.filename}"
+            temp_path = save_upload(file, filename=temp_filename)
+            target = temp_path
 
         await send_file_to_group(
             target,
@@ -74,6 +74,8 @@ async def deploy(
         )
     finally:
         await file.close()
+        if temp_path:
+            temp_path.unlink(missing_ok=True)
 
     filename = saved_path.name if saved_path else file.filename
     return {"status": "ok", "filename": filename, "size": size}
