@@ -21,6 +21,37 @@ app.add_middleware(
 )
 
 
+class NamedStream(BinaryIO):
+    def __init__(self, base: BinaryIO, name: str):
+        self._base = base
+        self._name = name
+
+    def __getattr__(self, item):
+        return getattr(self._base, item)
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def read(self, *args, **kwargs):
+        return self._base.read(*args, **kwargs)
+
+    def seek(self, *args, **kwargs):
+        return self._base.seek(*args, **kwargs)
+
+    def tell(self):
+        return self._base.tell()
+
+    def close(self):
+        return self._base.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+
+
 def save_upload(file: UploadFile, filename: str | None = None) -> Path:
     target = UPLOAD_DIR / (filename or file.filename)
     with target.open("wb") as out:
@@ -49,6 +80,7 @@ async def deploy(
 
     saved_path: Path | None = None
     temp_path: Path | None = None
+    temp_stream: NamedStream | None = None
     target: Path | BinaryIO
     filename_to_send = file.filename
 
@@ -62,7 +94,9 @@ async def deploy(
             await file.seek(0)
             temp_filename = f"tmp-{uuid.uuid4().hex}-{file.filename}"
             temp_path = save_upload(file, filename=temp_filename)
-            target = temp_path
+            base_stream = temp_path.open("rb")
+            temp_stream = NamedStream(base_stream, filename_to_send)
+            target = temp_stream
 
         await send_file_to_group(
             target,
@@ -74,6 +108,8 @@ async def deploy(
         )
     finally:
         await file.close()
+        if temp_stream:
+            temp_stream.close()
         if temp_path:
             temp_path.unlink(missing_ok=True)
 
