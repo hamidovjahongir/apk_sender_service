@@ -49,7 +49,6 @@ async def deploy(
 
     saved_path: Path | None = None
     temp_path: Path | None = None
-    temp_file: BinaryIO | None = None
     target: Path | BinaryIO
     filename_to_send = file.filename
 
@@ -63,9 +62,7 @@ async def deploy(
             await file.seek(0)
             temp_filename = f"tmp-{uuid.uuid4().hex}-{file.filename}"
             temp_path = save_upload(file, filename=temp_filename)
-            temp_file = temp_path.open("rb")
-            temp_file.name = filename_to_send
-            target = temp_file
+            target = temp_path
 
         await send_file_to_group(
             target,
@@ -77,8 +74,6 @@ async def deploy(
         )
     finally:
         await file.close()
-        if temp_file:
-            temp_file.close()
         if temp_path:
             temp_path.unlink(missing_ok=True)
 
