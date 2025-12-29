@@ -73,6 +73,9 @@ async def deploy(
     keep: bool = Form(False),
     group_id: int | None = Form(None),
     bot_token: str | None = Form(None),
+    button_text: str | None = Form(None),
+    button_url: str | None = Form(None),
+    button_active: bool = Form(False),
 ) -> dict[str, int | str]:
     size = _get_upload_size(file)
     if size > MAX_FILE_SIZE_BYTES:
@@ -105,6 +108,9 @@ async def deploy(
             group_id=group_id,
             bot_token=bot_token,
             file_size=size,
+            button_text=button_text,
+            button_url=button_url,
+            button_active=button_active,
         )
     finally:
         await file.close()

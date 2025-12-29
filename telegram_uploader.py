@@ -6,6 +6,7 @@ from typing import BinaryIO
 
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError, RPCError
+from telethon.tl.custom import Button
 
 from config import (
     API_HASH,
@@ -44,6 +45,9 @@ async def _send_single(
     filename: str,
     caption: str | None,
     chunk_size: int | None = None,
+    button_text: str | None = None,
+    button_url: str | None = None,
+    button_active: bool = False,
 ) -> None:
     send_kwargs = {
         "caption": caption or "New Flutter release",
@@ -56,6 +60,11 @@ async def _send_single(
     if chunk_size is not None:
         send_kwargs["chunk_size"] = chunk_size
 
+    # Button qo'shish - faqat active bo'lsa
+    if button_active and button_text and button_url:
+        buttons = [[Button.url(text=button_text, url=button_url)]]
+        send_kwargs["buttons"] = buttons
+
     await client.send_file(target_group, payload, **send_kwargs)
 
 
@@ -67,8 +76,21 @@ async def _dispatch_send(
     caption: str | None,
     file_size: int | None,
     chunk_size: int | None,
+    button_text: str | None = None,
+    button_url: str | None = None,
+    button_active: bool = False,
 ) -> None:
-    await _send_single(client, target_group, payload, filename, caption, chunk_size)
+    await _send_single(
+        client,
+        target_group,
+        payload,
+        filename,
+        caption,
+        chunk_size,
+        button_text,
+        button_url,
+        button_active,
+    )
 
 
 async def send_file_to_group(
@@ -78,6 +100,9 @@ async def send_file_to_group(
     group_id: int | None = None,
     bot_token: str | None = None,
     file_size: int | None = None,
+    button_text: str | None = None,
+    button_url: str | None = None,
+    button_active: bool = False,
 ) -> None:
     target_group = group_id if group_id is not None else GROUP_ID
     target_token = bot_token if bot_token is not None else BOT_TOKEN
@@ -95,11 +120,22 @@ async def send_file_to_group(
             caption,
             file_size,
             TELEGRAM_CHUNK_SIZE_BYTES,
+            button_text,
+            button_url,
+            button_active,
         )
     except FloodWaitError as exc:
         await asyncio.sleep(exc.seconds + 1)
         return await send_file_to_group(
-            payload, filename, caption, group_id, bot_token, file_size
+            payload,
+            filename,
+            caption,
+            group_id,
+            bot_token,
+            file_size,
+            button_text,
+            button_url,
+            button_active,
         )
     except RPCError as exc:
         raise exc
