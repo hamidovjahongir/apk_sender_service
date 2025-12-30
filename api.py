@@ -31,14 +31,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Health check endpoint
-@app.get("/")
-async def root():
-    return {"status": "ok", "message": "Flutter Relay Server is running"}
-
-@app.get("/health")
-async def health():
-    return {"status": "healthy"}
 
 
 class NamedStream(BinaryIO):
