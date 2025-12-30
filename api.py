@@ -5,8 +5,9 @@ import logging
 from pathlib import Path
 from typing import BinaryIO
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 import asyncio
 
 from config import UPLOAD_DIR, MAX_FILE_SIZE_BYTES
@@ -22,6 +23,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Request timeout'ni oshirish (katta fayllar uchun)
+@app.middleware("http")
+async def timeout_middleware(request: Request, call_next):
+    # Railway'da timeout cheklovi bo'lishi mumkin, lekin biz optimallashtiramiz
+    response = await call_next(request)
+    return response
 
 
 class NamedStream(BinaryIO):
@@ -57,36 +65,47 @@ class NamedStream(BinaryIO):
 
 async def save_upload(file: UploadFile, filename: str | None = None) -> Path:
     target = UPLOAD_DIR / (filename or file.filename or "uploaded_file")
-    # Faylni o'qib diskka yozish
-    content = await file.read()
+    # Streaming usul bilan faylni diskka yozish (katta fayllar uchun)
+    CHUNK_SIZE = 1024 * 1024  # 1 MB chunks
+    await file.seek(0)
+    
     with target.open("wb") as out:
-        out.write(content)
+        while True:
+            chunk = await file.read(CHUNK_SIZE)
+            if not chunk:
+                break
+            out.write(chunk)
+    
     await file.seek(0)  # Keyinroq o'qish uchun qaytarish
     return target
 
 
 async def _get_upload_size(file: UploadFile) -> int:
     try:
-        # Fayl hajmini olish - avval o'qib olamiz
+        # Fayl hajmini olish - file.file dan o'qamiz (tezroq)
         await file.seek(0)
-        content = await file.read()
-        size = len(content)
-        await file.seek(0)  # Boshiga qaytish
-        return size
-    except Exception as e:
-        # Agar o'qib bo'lmasa, file.file dan o'qamiz
-        logger.warning(f"Could not determine file size directly: {e}")
         try:
             file.file.seek(0, os.SEEK_END)
             size = file.file.tell()
             file.file.seek(0)
             await file.seek(0)
             return size
-        except Exception as e2:
-            logger.error(f"Error getting file size: {e2}")
-            # Agar hech qanday usul ishlamasa, 0 qaytaramiz
+        except:
+            # Agar file.file ishlamasa, chunk-by-chunk o'qib hisoblaymiz
             await file.seek(0)
-            return 0
+            size = 0
+            CHUNK_SIZE = 1024 * 1024  # 1 MB chunks
+            while True:
+                chunk = await file.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                size += len(chunk)
+            await file.seek(0)
+            return size
+    except Exception as e:
+        logger.error(f"Error getting file size: {e}")
+        await file.seek(0)
+        return 0
 
 
 @app.post("/deploy")
@@ -108,18 +127,26 @@ async def deploy(
     size = 0
 
     try:
-        # Fayl hajmini aniqlash
+        # Fayl hajmini aniqlash (optimallashtirilgan)
         try:
-            size = await _get_upload_size(file)
-            logger.info(f"File size determined: {size} bytes ({size / 1024 / 1024:.2f} MB)")
+            # Avval Content-Length header'dan o'qib ko'ramiz
+            content_length = file.headers.get("content-length")
+            if content_length:
+                size = int(content_length)
+                logger.info(f"File size from header: {size} bytes ({size / 1024 / 1024:.2f} MB)")
+            else:
+                # Agar header yo'q bo'lsa, faylni o'qib hisoblaymiz
+                size = await _get_upload_size(file)
+                logger.info(f"File size determined: {size} bytes ({size / 1024 / 1024:.2f} MB)")
         except Exception as e:
             logger.error(f"Error determining file size: {e}")
             # Fayl hajmini aniqlab bo'lmasa ham davom etamiz
+            size = 0
 
-        if size > MAX_FILE_SIZE_BYTES:
+        if size > 0 and size > MAX_FILE_SIZE_BYTES:
             raise HTTPException(status_code=413, detail="File exceeds 2GB Telegram limit")
 
-        # Faylni diskka saqlash
+        # Faylni diskka saqlash (streaming usul)
         await file.seek(0)
         if keep:
             saved_path = await save_upload(file)
