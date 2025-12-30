@@ -161,6 +161,11 @@ async def _process_file_upload(
     """
     temp_stream = None
     try:
+        # Fayl mavjudligini tekshirish
+        if not file_path.exists():
+            logger.error(f"File does not exist: {file_path}")
+            return
+        
         file_size = file_path.stat().st_size
         logger.info(f"Starting Telegram upload: {filename} ({file_size / 1024 / 1024:.2f} MB)")
         
@@ -185,14 +190,15 @@ async def _process_file_upload(
         
     except Exception as e:
         logger.error(f"Error in background task for {filename}: {e}", exc_info=True)
-        raise  # Xatolikni qayta ko'tarish
+        # Background task'da xatolik bo'lsa ham, asosiy request'ga ta'sir qilmaydi
+        # Faqat log qilamiz
     finally:
         # Resurslarni tozalash
         if temp_stream:
             try:
                 temp_stream.close()
-            except:
-                pass
+            except Exception as e:
+                logger.warning(f"Error closing stream: {e}")
         
         # Memory cleanup
         gc.collect()
@@ -254,6 +260,7 @@ async def deploy(
 
         # 3. Faylni diskka saqlash (streaming usul - memory-efficient)
         await file.seek(0)
+        file_path: Path | None = None
         try:
             if keep:
                 saved_path = await save_upload(file)
@@ -274,6 +281,9 @@ async def deploy(
         logger.info(f"File saved successfully: {filename_to_send} ({size / 1024 / 1024:.2f} MB)")
 
         # 4. Background task'ga qo'shish - Telegram'ga yuborish
+        if file_path is None:
+            raise HTTPException(status_code=500, detail="File path is None after saving")
+        
         background_tasks.add_task(
             _process_file_upload,
             file_path,
@@ -289,17 +299,27 @@ async def deploy(
 
         logger.info(f"File upload queued for Telegram: {filename_to_send}")
 
-    except HTTPException:
+    except HTTPException as e:
+        logger.error(f"HTTPException: {e.detail}")
         raise
+    except ValueError as e:
+        logger.error(f"ValueError: {e}", exc_info=True)
+        raise HTTPException(status_code=400, detail=f"Invalid input: {str(e)}")
     except Exception as e:
         logger.error(f"Error processing file upload: {e}", exc_info=True)
+        error_msg = str(e)
         # Agar xatolik bo'lsa, saqlangan faylni o'chiramiz
         if temp_path and temp_path.exists():
             try:
                 temp_path.unlink(missing_ok=True)
             except:
                 pass
-        raise HTTPException(status_code=500, detail=f"Failed to process file: {str(e)}")
+        if saved_path and saved_path.exists() and not keep:
+            try:
+                saved_path.unlink(missing_ok=True)
+            except:
+                pass
+        raise HTTPException(status_code=500, detail=f"Failed to process file: {error_msg}")
     finally:
         # Resurslarni tozalash
         try:
