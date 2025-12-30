@@ -1,21 +1,26 @@
 import os
-import shutil
 import uuid
 import logging
+import gc
 from pathlib import Path
 from typing import BinaryIO
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from starlette.middleware import Middleware
-from starlette.middleware.base import BaseHTTPMiddleware
 import asyncio
 
 from config import UPLOAD_DIR, MAX_FILE_SIZE_BYTES
 from telegram_uploader import send_file_to_group
 
+# Logging konfiguratsiyasi
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
+
+# Optimallashtirish konstantalari
+CHUNK_SIZE = 2 * 1024 * 1024  # 2 MB chunks (xotira optimallashtirish uchun)
 
 app = FastAPI(title="Flutter Relay Server")
 
@@ -26,12 +31,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Request timeout'ni oshirish (katta fayllar uchun)
-@app.middleware("http")
-async def timeout_middleware(request: Request, call_next):
-    # Railway'da timeout cheklovi bo'lishi mumkin, lekin biz optimallashtiramiz
-    response = await call_next(request)
-    return response
+# Health check endpoint
+@app.get("/")
+async def root():
+    return {"status": "ok", "message": "Flutter Relay Server is running"}
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy"}
 
 
 class NamedStream(BinaryIO):
@@ -66,44 +73,71 @@ class NamedStream(BinaryIO):
 
 
 async def save_upload(file: UploadFile, filename: str | None = None) -> Path:
+    """
+    Streaming usul bilan faylni diskka yozish (2 GB gacha optimallashtirilgan)
+    Memory-efficient: 2 MB chunks ishlatadi
+    """
     target = UPLOAD_DIR / (filename or file.filename or "uploaded_file")
-    # Streaming usul bilan faylni diskka yozish (katta fayllar uchun)
-    CHUNK_SIZE = 1024 * 1024  # 1 MB chunks
     await file.seek(0)
     
-    with target.open("wb") as out:
-        while True:
-            chunk = await file.read(CHUNK_SIZE)
-            if not chunk:
-                break
-            out.write(chunk)
+    bytes_written = 0
+    try:
+        with target.open("wb") as out:
+            while True:
+                chunk = await file.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                out.write(chunk)
+                bytes_written += len(chunk)
+                
+                # Har 100 MB yozilganda progress log
+                if bytes_written % (100 * 1024 * 1024) == 0:
+                    logger.info(f"Upload progress: {bytes_written / 1024 / 1024:.2f} MB written")
+        
+        logger.info(f"File saved successfully: {bytes_written / 1024 / 1024:.2f} MB")
+    except Exception as e:
+        # Agar xatolik bo'lsa, yarim yozilgan faylni o'chiramiz
+        if target.exists():
+            try:
+                target.unlink(missing_ok=True)
+            except:
+                pass
+        raise
     
-    await file.seek(0)  # Keyinroq o'qish uchun qaytarish
+    await file.seek(0)
     return target
 
 
 async def _get_upload_size(file: UploadFile) -> int:
+    """
+    Fayl hajmini aniqlash (optimallashtirilgan)
+    Avval Content-Length header'dan, keyin file.file dan, oxirida chunk-by-chunk
+    """
     try:
-        # Fayl hajmini olish - file.file dan o'qamiz (tezroq)
         await file.seek(0)
+        
+        # 1. file.file dan o'qish (eng tez)
         try:
             file.file.seek(0, os.SEEK_END)
             size = file.file.tell()
             file.file.seek(0)
             await file.seek(0)
-            return size
+            if size > 0:
+                return size
         except:
-            # Agar file.file ishlamasa, chunk-by-chunk o'qib hisoblaymiz
-            await file.seek(0)
-            size = 0
-            CHUNK_SIZE = 1024 * 1024  # 1 MB chunks
-            while True:
-                chunk = await file.read(CHUNK_SIZE)
-                if not chunk:
-                    break
-                size += len(chunk)
-            await file.seek(0)
-            return size
+            pass
+        
+        # 2. Chunk-by-chunk o'qib hisoblash (memory-efficient)
+        await file.seek(0)
+        size = 0
+        while True:
+            chunk = await file.read(CHUNK_SIZE)
+            if not chunk:
+                break
+            size += len(chunk)
+        
+        await file.seek(0)
+        return size
     except Exception as e:
         logger.error(f"Error getting file size: {e}")
         await file.seek(0)
@@ -121,39 +155,55 @@ async def _process_file_upload(
     button_active: bool,
     keep: bool,
 ):
-    """Background task - faylni Telegram'ga yuborish"""
+    """
+    Background task - faylni Telegram'ga yuborish (optimallashtirilgan)
+    Memory-efficient va error handling bilan
+    """
+    temp_stream = None
     try:
-        logger.info(f"Processing file upload: {filename}")
+        file_size = file_path.stat().st_size
+        logger.info(f"Starting Telegram upload: {filename} ({file_size / 1024 / 1024:.2f} MB)")
+        
+        # Streaming usul bilan faylni ochish
         target = file_path.open("rb")
         temp_stream = NamedStream(target, filename)
         
+        # Telegram'ga yuborish
         await send_file_to_group(
             temp_stream,
             filename=filename,
             caption=caption,
             group_id=group_id,
             bot_token=bot_token,
-            file_size=file_path.stat().st_size,
+            file_size=file_size,
             button_text=button_text,
             button_url=button_url,
             button_active=button_active,
         )
         
-        temp_stream.close()
+        logger.info(f"File sent successfully to Telegram: {filename}")
+        
+    except Exception as e:
+        logger.error(f"Error in background task for {filename}: {e}", exc_info=True)
+        raise  # Xatolikni qayta ko'tarish
+    finally:
+        # Resurslarni tozalash
+        if temp_stream:
+            try:
+                temp_stream.close()
+            except:
+                pass
+        
+        # Memory cleanup
+        gc.collect()
         
         # Agar keep=False bo'lsa, faylni o'chiramiz
         if not keep and file_path.exists():
-            file_path.unlink(missing_ok=True)
-            
-        logger.info(f"File sent successfully: {filename}")
-    except Exception as e:
-        logger.error(f"Error in background task: {e}", exc_info=True)
-        # Xatolik bo'lsa ham faylni o'chirishga harakat qilamiz
-        if not keep and file_path.exists():
             try:
                 file_path.unlink(missing_ok=True)
-            except:
-                pass
+                logger.info(f"Temporary file deleted: {filename}")
+            except Exception as e:
+                logger.warning(f"Could not delete temporary file {filename}: {e}")
 
 
 @app.post("/deploy")
@@ -168,49 +218,62 @@ async def deploy(
     button_url: str | None = Form(None),
     button_active: bool = Form(False),
 ) -> dict[str, int | str]:
+    """
+    Fayl yuklash endpoint (2 GB gacha optimallashtirilgan)
+    Streaming upload, memory-efficient, background processing
+    """
     saved_path: Path | None = None
     temp_path: Path | None = None
     filename_to_send = file.filename or "unknown_file"
     size = 0
 
     try:
-        # Fayl hajmini aniqlash (optimallashtirilgan)
+        logger.info(f"Received upload request: {filename_to_send}")
+        
+        # 1. Fayl hajmini aniqlash (optimallashtirilgan)
         try:
-            # Avval Content-Length header'dan o'qib ko'ramiz
+            # Avval Content-Length header'dan o'qib ko'ramiz (eng tez)
             content_length = file.headers.get("content-length")
             if content_length:
                 size = int(content_length)
-                logger.info(f"File size from header: {size} bytes ({size / 1024 / 1024:.2f} MB)")
+                logger.info(f"File size from header: {size / 1024 / 1024:.2f} MB")
             else:
                 # Agar header yo'q bo'lsa, faylni o'qib hisoblaymiz
                 size = await _get_upload_size(file)
-                logger.info(f"File size determined: {size} bytes ({size / 1024 / 1024:.2f} MB)")
+                logger.info(f"File size determined: {size / 1024 / 1024:.2f} MB")
         except Exception as e:
-            logger.error(f"Error determining file size: {e}")
-            # Fayl hajmini aniqlab bo'lmasa ham davom etamiz
+            logger.warning(f"Could not determine file size: {e}, continuing...")
             size = 0
 
+        # 2. Fayl hajmi cheklovini tekshirish
         if size > 0 and size > MAX_FILE_SIZE_BYTES:
-            raise HTTPException(status_code=413, detail="File exceeds 2GB Telegram limit")
+            raise HTTPException(
+                status_code=413,
+                detail=f"File size ({size / 1024 / 1024 / 1024:.2f} GB) exceeds maximum limit (2 GB)"
+            )
 
-        # Faylni diskka saqlash (streaming usul)
+        # 3. Faylni diskka saqlash (streaming usul - memory-efficient)
         await file.seek(0)
-        if keep:
-            saved_path = await save_upload(file)
-            filename_to_send = saved_path.name
-            if size == 0:
-                size = saved_path.stat().st_size
-            file_path = saved_path
-        else:
-            temp_filename = f"tmp-{uuid.uuid4().hex}-{filename_to_send}"
-            temp_path = await save_upload(file, filename=temp_filename)
-            if size == 0:
-                size = temp_path.stat().st_size
-            file_path = temp_path
+        try:
+            if keep:
+                saved_path = await save_upload(file)
+                filename_to_send = saved_path.name
+                if size == 0:
+                    size = saved_path.stat().st_size
+                file_path = saved_path
+            else:
+                temp_filename = f"tmp-{uuid.uuid4().hex}-{filename_to_send}"
+                temp_path = await save_upload(file, filename=temp_filename)
+                if size == 0:
+                    size = temp_path.stat().st_size
+                file_path = temp_path
+        except Exception as e:
+            logger.error(f"Error saving file: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Failed to save file: {str(e)}")
 
-        logger.info(f"File saved: {filename_to_send} ({size / 1024 / 1024:.2f} MB)")
+        logger.info(f"File saved successfully: {filename_to_send} ({size / 1024 / 1024:.2f} MB)")
 
-        # Background task'ga qo'shish - Telegram'ga yuborish
+        # 4. Background task'ga qo'shish - Telegram'ga yuborish
         background_tasks.add_task(
             _process_file_upload,
             file_path,
@@ -224,12 +287,12 @@ async def deploy(
             keep,
         )
 
-        logger.info(f"File upload queued: {filename_to_send}")
+        logger.info(f"File upload queued for Telegram: {filename_to_send}")
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error processing file: {e}", exc_info=True)
+        logger.error(f"Error processing file upload: {e}", exc_info=True)
         # Agar xatolik bo'lsa, saqlangan faylni o'chiramiz
         if temp_path and temp_path.exists():
             try:
@@ -238,16 +301,21 @@ async def deploy(
                 pass
         raise HTTPException(status_code=500, detail=f"Failed to process file: {str(e)}")
     finally:
+        # Resurslarni tozalash
         try:
             await file.close()
         except:
             pass
+        
+        # Memory cleanup
+        gc.collect()
 
     filename = saved_path.name if saved_path else filename_to_send
     return {
         "status": "ok",
         "filename": filename,
         "size": size,
+        "size_mb": round(size / 1024 / 1024, 2),
         "message": "File uploaded successfully. Processing in background..."
     }
 

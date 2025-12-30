@@ -1,12 +1,14 @@
 import asyncio
-import io
+import logging
 from hashlib import sha256
 from pathlib import Path
 from typing import BinaryIO
 
 from telethon import TelegramClient
-from telethon.errors import FloodWaitError, RPCError
+from telethon.errors import FloodWaitError, RPCError, SessionPasswordNeededError
 from telethon.tl.custom import Button
+
+logger = logging.getLogger(__name__)
 
 from config import (
     API_HASH,
@@ -103,42 +105,98 @@ async def send_file_to_group(
     button_text: str | None = None,
     button_url: str | None = None,
     button_active: bool = False,
+    max_retries: int = 3,
 ) -> None:
+    """
+    Faylni Telegram guruhiga yuborish (optimallashtirilgan, retry mechanism bilan)
+    
+    Args:
+        payload: Fayl path yoki BinaryIO stream
+        filename: Fayl nomi
+        caption: Fayl caption
+        group_id: Target group ID
+        bot_token: Bot token
+        file_size: Fayl hajmi (bytes)
+        button_text: Tugma matni
+        button_url: Tugma URL
+        button_active: Tugma faolligi
+        max_retries: Maksimal retry soni
+    """
     target_group = group_id if group_id is not None else GROUP_ID
     target_token = bot_token if bot_token is not None else BOT_TOKEN
     session_path = _session_path_for_token(target_token)
 
-    client = TelegramClient(session_path, API_ID, API_HASH)
-    await client.start(bot_token=target_token)
-
-    try:
-        await _dispatch_send(
-            client,
-            target_group,
-            payload,
-            filename,
-            caption,
-            file_size,
-            TELEGRAM_CHUNK_SIZE_BYTES,
-            button_text,
-            button_url,
-            button_active,
-        )
-    except FloodWaitError as exc:
-        await asyncio.sleep(exc.seconds + 1)
-        return await send_file_to_group(
-            payload,
-            filename,
-            caption,
-            group_id,
-            bot_token,
-            file_size,
-            button_text,
-            button_url,
-            button_active,
-        )
-    except RPCError as exc:
-        raise exc
-    finally:
-        await client.disconnect()
+    client = None
+    retry_count = 0
+    
+    while retry_count < max_retries:
+        try:
+            logger.info(f"Connecting to Telegram (attempt {retry_count + 1}/{max_retries})")
+            client = TelegramClient(session_path, API_ID, API_HASH)
+            await client.start(bot_token=target_token)
+            
+            file_size_str = f"{file_size / 1024 / 1024:.2f} MB" if file_size else "unknown size"
+            logger.info(f"Sending file to Telegram: {filename} ({file_size_str})")
+            
+            await _dispatch_send(
+                client,
+                target_group,
+                payload,
+                filename,
+                caption,
+                file_size,
+                TELEGRAM_CHUNK_SIZE_BYTES,
+                button_text,
+                button_url,
+                button_active,
+            )
+            
+            logger.info(f"File sent successfully: {filename}")
+            return  # Muvaffaqiyatli yuborildi
+            
+        except FloodWaitError as exc:
+            wait_time = exc.seconds + 1
+            logger.warning(f"FloodWait error: waiting {wait_time} seconds...")
+            await asyncio.sleep(wait_time)
+            retry_count += 1
+            # Payload'ni qayta o'qish uchun seek qilamiz
+            if hasattr(payload, 'seek'):
+                try:
+                    payload.seek(0)
+                except:
+                    pass
+            continue
+            
+        except SessionPasswordNeededError:
+            logger.error("Session password needed - this should not happen with bot token")
+            raise RPCError("Session password needed")
+            
+        except RPCError as exc:
+            logger.error(f"RPC error (attempt {retry_count + 1}/{max_retries}): {exc}")
+            retry_count += 1
+            if retry_count >= max_retries:
+                raise exc
+            # Kichik kutish va qayta urinish
+            await asyncio.sleep(2)
+            # Payload'ni qayta o'qish uchun seek qilamiz
+            if hasattr(payload, 'seek'):
+                try:
+                    payload.seek(0)
+                except:
+                    pass
+            continue
+            
+        except Exception as exc:
+            logger.error(f"Unexpected error: {exc}", exc_info=True)
+            raise exc
+            
+        finally:
+            if client:
+                try:
+                    await client.disconnect()
+                except:
+                    pass
+    
+    # Agar barcha urinishlar muvaffaqiyatsiz bo'lsa
+    raise RPCError(f"Failed to send file after {max_retries} attempts")
 
