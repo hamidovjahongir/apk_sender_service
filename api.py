@@ -5,9 +5,11 @@ import logging
 from pathlib import Path
 from typing import BinaryIO
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from starlette.middleware import Middleware
+from starlette.middleware.base import BaseHTTPMiddleware
 import asyncio
 
 from config import UPLOAD_DIR, MAX_FILE_SIZE_BYTES
@@ -108,8 +110,55 @@ async def _get_upload_size(file: UploadFile) -> int:
         return 0
 
 
+async def _process_file_upload(
+    file_path: Path,
+    filename: str,
+    caption: str | None,
+    group_id: int | None,
+    bot_token: str | None,
+    button_text: str | None,
+    button_url: str | None,
+    button_active: bool,
+    keep: bool,
+):
+    """Background task - faylni Telegram'ga yuborish"""
+    try:
+        logger.info(f"Processing file upload: {filename}")
+        target = file_path.open("rb")
+        temp_stream = NamedStream(target, filename)
+        
+        await send_file_to_group(
+            temp_stream,
+            filename=filename,
+            caption=caption,
+            group_id=group_id,
+            bot_token=bot_token,
+            file_size=file_path.stat().st_size,
+            button_text=button_text,
+            button_url=button_url,
+            button_active=button_active,
+        )
+        
+        temp_stream.close()
+        
+        # Agar keep=False bo'lsa, faylni o'chiramiz
+        if not keep and file_path.exists():
+            file_path.unlink(missing_ok=True)
+            
+        logger.info(f"File sent successfully: {filename}")
+    except Exception as e:
+        logger.error(f"Error in background task: {e}", exc_info=True)
+        # Xatolik bo'lsa ham faylni o'chirishga harakat qilamiz
+        if not keep and file_path.exists():
+            try:
+                file_path.unlink(missing_ok=True)
+            except:
+                pass
+
+
 @app.post("/deploy")
 async def deploy(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     caption: str | None = Form(None),
     keep: bool = Form(False),
@@ -121,8 +170,6 @@ async def deploy(
 ) -> dict[str, int | str]:
     saved_path: Path | None = None
     temp_path: Path | None = None
-    temp_stream: NamedStream | None = None
-    target: Path | BinaryIO
     filename_to_send = file.filename or "unknown_file"
     size = 0
 
@@ -150,57 +197,57 @@ async def deploy(
         await file.seek(0)
         if keep:
             saved_path = await save_upload(file)
-            target = saved_path
             filename_to_send = saved_path.name
             if size == 0:
                 size = saved_path.stat().st_size
+            file_path = saved_path
         else:
             temp_filename = f"tmp-{uuid.uuid4().hex}-{filename_to_send}"
             temp_path = await save_upload(file, filename=temp_filename)
             if size == 0:
                 size = temp_path.stat().st_size
-            base_stream = temp_path.open("rb")
-            temp_stream = NamedStream(base_stream, filename_to_send)
-            target = temp_stream
+            file_path = temp_path
 
-        logger.info(f"Sending file to Telegram: {filename_to_send} ({size / 1024 / 1024:.2f} MB)")
+        logger.info(f"File saved: {filename_to_send} ({size / 1024 / 1024:.2f} MB)")
 
-        # Telegram'ga yuborish
-        await send_file_to_group(
-            target,
-            filename=filename_to_send,
-            caption=caption,
-            group_id=group_id,
-            bot_token=bot_token,
-            file_size=size,
-            button_text=button_text,
-            button_url=button_url,
-            button_active=button_active,
+        # Background task'ga qo'shish - Telegram'ga yuborish
+        background_tasks.add_task(
+            _process_file_upload,
+            file_path,
+            filename_to_send,
+            caption,
+            group_id,
+            bot_token,
+            button_text,
+            button_url,
+            button_active,
+            keep,
         )
 
-        logger.info(f"File sent successfully: {filename_to_send}")
+        logger.info(f"File upload queued: {filename_to_send}")
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error sending file: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to send file: {str(e)}")
-    finally:
-        try:
-            await file.close()
-        except:
-            pass
-        if temp_stream:
-            try:
-                temp_stream.close()
-            except:
-                pass
+        logger.error(f"Error processing file: {e}", exc_info=True)
+        # Agar xatolik bo'lsa, saqlangan faylni o'chiramiz
         if temp_path and temp_path.exists():
             try:
                 temp_path.unlink(missing_ok=True)
             except:
                 pass
+        raise HTTPException(status_code=500, detail=f"Failed to process file: {str(e)}")
+    finally:
+        try:
+            await file.close()
+        except:
+            pass
 
     filename = saved_path.name if saved_path else filename_to_send
-    return {"status": "ok", "filename": filename, "size": size}
+    return {
+        "status": "ok",
+        "filename": filename,
+        "size": size,
+        "message": "File uploaded successfully. Processing in background..."
+    }
 
