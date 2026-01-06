@@ -1,0 +1,32 @@
+services:
+  apk-sender:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: apk_sender_service
+    ports:
+      - "${PORT:-8000}:8000"
+    volumes:
+      # Sessions va uploads papkalarini saqlash uchun (persistent storage)
+      - ./sessions:/app/sessions
+      - ./uploads:/app/uploads
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - HOST=0.0.0.0
+      - PORT=8000
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/docs', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - apk-sender-network
+
+networks:
+  apk-sender-network:
+    driver: bridge
+
