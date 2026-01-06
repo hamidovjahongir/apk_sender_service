@@ -7,7 +7,8 @@ from typing import BinaryIO, Union
 
 from telethon import TelegramClient
 from telethon.tl.types import InputPeerChannel, InputPeerChat, InputPeerUser
-from telethon.errors import FloodWaitError, RPCError, SessionPasswordNeededError, PeerIdInvalidError
+from telethon.errors import FloodWaitError, RPCError, SessionPasswordNeededError, PeerIdInvalidError, ButtonUrlInvalidError
+from urllib.parse import urlparse
 from telethon.tl.custom import Button
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,21 @@ def _overall_caption(
     return base
 
 
+def _is_valid_http_url(url: str | None) -> bool:
+    """Validate http/https URL for Telegram buttons."""
+    if not url:
+        return False
+    url = url.strip()
+    if " " in url:
+        return False
+    try:
+        parsed = urlparse(url)
+        host_ok = parsed.netloc and "." in parsed.netloc
+        return parsed.scheme in ("http", "https") and host_ok
+    except Exception:
+        return False
+
+
 async def _send_single(
     client: TelegramClient,
     target_group: Union[int, InputPeerChannel, InputPeerChat, InputPeerUser, object],
@@ -74,9 +90,11 @@ async def _send_single(
     if chunk_size is not None:
         send_kwargs["chunk_size"] = chunk_size
 
-    # Button qo'shish - faqat active bo'lsa
-    if button_active and button_text and button_url:
-        buttons = [[Button.url(text=button_text, url=button_url)]]
+    # Button qo'shish - faqat active bo'lsa, URL ni validatsiya qilamiz
+    if button_active:
+        if not button_text or not button_url or not _is_valid_http_url(button_url):
+            raise ValueError("Invalid button parameters: button_text/button_url required and URL must be http/https.")
+        buttons = [[Button.url(text=button_text, url=button_url.strip())]]
         send_kwargs["buttons"] = buttons
 
     await client.send_file(target_group, payload, **send_kwargs)
@@ -272,6 +290,9 @@ async def send_file_to_group(
                         button_url,
                         button_active,
                     )
+                except ButtonUrlInvalidError as b_err:
+                    logger.error(f"Button URL invalid: {b_err}")
+                    raise ValueError("Button URL invalid. Please provide a valid http/https URL.")
                 except PeerIdInvalidError as peer_error:
                     # Agar PeerIdInvalidError bo'lsa va entity hali ham InputPeerChat yoki boshqa noto'g'ri format bo'lsa,
                     # integer ID bilan qayta urinamiz

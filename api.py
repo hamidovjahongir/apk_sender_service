@@ -2,6 +2,7 @@ import os
 import logging
 import gc
 from typing import BinaryIO
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,6 +30,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+
+def _is_valid_http_url(url: str) -> bool:
+    """Validate http/https URL for Telegram button."""
+    try:
+        if not url:
+            return False
+        url = url.strip()
+        if " " in url:
+            return False
+        parsed = urlparse(url)
+        # netloc should contain at least a dot to avoid bare host
+        host_ok = parsed.netloc and "." in parsed.netloc
+        return parsed.scheme in ("http", "https") and host_ok
+    except Exception:
+        return False
 
 
 class NamedStream(BinaryIO):
@@ -118,6 +135,19 @@ async def deploy(
     try:
         logger.info(f"Received upload request: {filename_to_send}")
         
+        # 0. Button validation (oldindan tekshirish, Telegramga xato ketmasin)
+        if button_active:
+            if not button_text or not button_url:
+                raise HTTPException(
+                    status_code=400,
+                    detail="button_active=True bo'lsa, button_text va button_url majburiy."
+                )
+            if not _is_valid_http_url(button_url.strip()):
+                raise HTTPException(
+                    status_code=400,
+                    detail="button_url noto'g'ri. To'liq http(s) URL kiriting."
+                )
+
         # 1. Fayl hajmini aniqlash (optimallashtirilgan)
         try:
             # Avval Content-Length header'dan o'qib ko'ramiz (eng tez)
